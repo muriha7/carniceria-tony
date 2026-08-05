@@ -307,18 +307,25 @@ async function excelSyncVentaDia(fileId, semSheet, dateStr, turno, turnoForm, de
   if (deliveriesDirty && day <= 4) {
     const previo = await excelReadRange(fileId, ws, `${c1}15:${c2}19`);
     antes.deliveries = { rango: `${c1}15:${c2}19`, valores: previo.values || [] };
+    // Una sola escritura para las 5 filas de delivery en vez de 5 llamadas separadas: reduce la
+    // ventana en la que un corte de conexión puede dejar solo algunas filas actualizadas y otras
+    // con el valor viejo (el mismo tipo de problema que causó la fila huérfana en Compras).
+    const filasDelivery = [];
     for (let i = 0; i < 5; i++) {
       const it = deliveries[i] || {};
-      await excelWriteVerificado(fileId, ws, `${c1}${15 + i}:${c2}${15 + i}`, [[num(it.ef), num(it.tr)]]);
+      filasDelivery.push([num(it.ef), num(it.tr)]);
     }
+    await excelWriteVerificado(fileId, ws, `${c1}15:${c2}19`, filasDelivery);
   }
   if (clientesDirty && day <= 5) {
     const previo = await excelReadRange(fileId, ws, `${c0}24:${c3}31`);
     antes.clientes = { rango: `${c0}24:${c3}31`, valores: previo.values || [] };
+    const filasClientes = [];
     for (let i = 0; i < 8; i++) {
       const it = clientes[i] || {};
-      await excelWriteVerificado(fileId, ws, `${c0}${24 + i}:${c3}${24 + i}`, [[it.nombre || '', num(it.ef), num(it.tr), it.cobrado ? 'SI' : '']]);
+      filasClientes.push([it.nombre || '', num(it.ef), num(it.tr), it.cobrado ? 'SI' : '']);
     }
+    await excelWriteVerificado(fileId, ws, `${c0}24:${c3}31`, filasClientes);
   }
   return { antes, ws };
 }
@@ -338,9 +345,8 @@ async function excelDeshacerCompra(fileId, semSheet, row, fechaSerialEsperada) {
   if (actualFecha !== fechaSerialEsperada) {
     throw new Error('Esa fila ya fue modificada después de cargarla — no se puede deshacer automáticamente. Corregila a mano en el Excel.');
   }
-  await excelWriteVerificado(fileId, ws, `D${row}:H${row}`, [['', '', '', '', '']]);
+  await excelWriteVerificado(fileId, ws, `B${row}:H${row}`, [['', '', '', '', '', '', '']]);
   await excelWriteVerificado(fileId, ws, `J${row}:J${row}`, [['']]);
-  await excelWriteVerificado(fileId, ws, `B${row}:B${row}`, [['']]);
 }
 
 // ---------- compras: kg/unidad o importe directo, con Observaciones (req. 8) ----------
@@ -351,24 +357,36 @@ async function excelSyncCompra(fileId, semSheet, compra, filaAsignada, onRowAssi
   const ws = `${semSheet} — Compras`;
   let row = filaAsignada;
   if (!row) {
-    const colB = await excelReadRange(fileId, ws, 'B3:B42');
-    const vals = colB.values || [];
+    // Lee fecha (B) Y el resto de los datos (D:J): una fila solo se considera libre si TODO está
+    // vacío. Si solo mirásemos la fecha, una fila que haya quedado con datos parciales de una
+    // operación anterior interrumpida (con fecha sin escribir todavía) se vería "libre" y una
+    // compra nueva la pisaría a medias — mezclando dos compras distintas en la misma fila.
+    const rango = await excelReadRange(fileId, ws, 'B3:J42');
+    const vals = rango.values || [];
     for (let i = 0; i < vals.length; i++) {
-      if (!vals[i][0]) { row = 3 + i; break; }
+      const fila = vals[i] || [];
+      const vacia = fila.every((v) => v === '' || v == null);
+      if (vacia) { row = 3 + i; break; }
     }
-    if (!row) throw new Error('No hay filas disponibles en Compras de esta semana. La capacidad máxima es de 40 compras.');
+    if (!row) throw new Error('No hay filas disponibles en Compras de esta semana. La capacidad máxima es de 40 compras. Si creés que hay filas con datos parciales o corruptos ocupando lugar, revisalas directamente en el Excel.');
   }
   if (onRowAssigned) onRowAssigned(row);
-  // D:H primero (datos), después Observaciones, y la Fecha (B) al final: si algo falla antes,
-  // B queda vacía y la fila se sigue viendo libre — así nunca queda una compra "a medias" confirmada.
+  // Fecha + datos en UNA sola escritura atómica (B:H): así una fila nunca puede quedar con datos
+  // pero sin fecha (el patrón "fantasma" que causaba que dos compras distintas terminaran
+  // mezcladas en la misma fila). Observaciones (J) va aparte porque el rango B:J incluye la
+  // columna I, que tiene la fórmula del Total y no se debe pisar.
   if (compra.modo === 'importe') {
-    await excelWriteVerificado(fileId, ws, `D${row}:G${row}`, [[compra.proveedor, compra.descripcion || '', compra.tipo, parseImporte(compra.importe)]]);
-    await excelWriteVerificado(fileId, ws, `H${row}:H${row}`, [['']]);
+    await excelWriteVerificado(fileId, ws, `B${row}:H${row}`, [[
+      toExcelSerial(compra.fecha), DIAS_NOMBRE[weekdayIdx(compra.fecha)],
+      compra.proveedor, compra.descripcion || '', compra.tipo, parseImporte(compra.importe), '',
+    ]]);
   } else {
-    await excelWriteVerificado(fileId, ws, `D${row}:H${row}`, [[compra.proveedor, compra.descripcion || '', compra.tipo, parseCantidad(compra.kg), parseImporte(compra.precioKg)]]);
+    await excelWriteVerificado(fileId, ws, `B${row}:H${row}`, [[
+      toExcelSerial(compra.fecha), DIAS_NOMBRE[weekdayIdx(compra.fecha)],
+      compra.proveedor, compra.descripcion || '', compra.tipo, parseCantidad(compra.kg), parseImporte(compra.precioKg),
+    ]]);
   }
   await excelWriteVerificado(fileId, ws, `J${row}:J${row}`, [[compra.observaciones || '']]);
-  await excelWriteVerificado(fileId, ws, `B${row}:C${row}`, [[toExcelSerial(compra.fecha), DIAS_NOMBRE[weekdayIdx(compra.fecha)]]]);
   return row;
 }
 
@@ -403,15 +421,23 @@ async function excelSyncGasto(fileId, semSheet, tipo, monto, baseConocido, onBas
 }
 
 // req. 6: reconstruye la lista real de compras de la semana leyendo directo del Excel (B:J, filas 3-42)
+// También detecta filas "huérfanas": tienen algún dato cargado (proveedor, tipo, etc.) pero sin
+// fecha en B — señal de una escritura que quedó a medias (ver excelSyncCompra). Se devuelven aparte
+// en out.huerfanas para poder avisarle al usuario en vez de esconderlas en silencio.
 async function excelLeerComprasSemana(fileId, semSheet) {
   const ws = `${semSheet} — Compras`;
   const r = await excelReadRange(fileId, ws, 'B3:J42');
   const filas = r.values || [];
   const out = [];
+  const huerfanas = [];
   filas.forEach((f, i) => {
     const fechaSerial = f[0];
-    if (!fechaSerial) return; // fila vacía
     const row = 3 + i;
+    if (!fechaSerial) {
+      const tieneAlgo = (f || []).some((v, idx) => idx > 0 && v !== '' && v != null);
+      if (tieneAlgo) huerfanas.push({ row, proveedor: f[2] || '', descripcion: f[3] || '', observaciones: f[8] || '' });
+      return; // fila vacía (o huérfana, ya registrada arriba)
+    }
     const fechaJS = typeof fechaSerial === 'number' ? fromExcelSerial(fechaSerial) : new Date(fechaSerial);
     const fecha = `${fechaJS.getUTCFullYear()}-${String(fechaJS.getUTCMonth() + 1).padStart(2, '0')}-${String(fechaJS.getUTCDate()).padStart(2, '0')}`;
     out.push({
@@ -428,6 +454,7 @@ async function excelLeerComprasSemana(fileId, semSheet) {
       fuente: 'excel',
     });
   });
+  out.huerfanas = huerfanas;
   return out;
 }
 
@@ -1048,6 +1075,7 @@ function CarniceriaApp() {
   const [resumenExcelHora, setResumenExcelHora] = useState(null);
 
   const [comprasSync, setComprasSync] = useState('idle'); // idle|loading|error
+  const [comprasHuerfanas, setComprasHuerfanas] = useState([]); // filas con datos pero sin fecha (req. urgente: detectar corrupción)
   const actualizarComprasDesdeExcel = async () => {
     if (!cuentaConectada || !excelFile) { setSyncMsg({ type: 'error', text: 'Conectá el Excel primero.' }); return; }
     setComprasSync('loading');
@@ -1058,7 +1086,11 @@ function CarniceriaApp() {
         const otrasSemanas = prev.filter((c) => !weekDates.includes(c.fecha));
         return [...desdeExcel, ...otrasSemanas];
       });
-      setSyncMsg({ type: 'ok', text: `Compras actualizadas desde Excel (${desdeExcel.length} filas) ✓` });
+      setComprasHuerfanas(desdeExcel.huerfanas || []);
+      const avisoHuerfanas = (desdeExcel.huerfanas || []).length > 0
+        ? ` ⚠️ Hay ${desdeExcel.huerfanas.length} fila${desdeExcel.huerfanas.length === 1 ? '' : 's'} con datos pero sin fecha (revisalas más abajo).`
+        : '';
+      setSyncMsg({ type: (desdeExcel.huerfanas || []).length > 0 ? 'error' : 'ok', text: `Compras actualizadas desde Excel (${desdeExcel.length} filas) ✓${avisoHuerfanas}` });
       setComprasSync('idle');
     } catch (e) {
       setSyncMsg({ type: 'error', text: 'No se pudo leer Compras: ' + e.message });
@@ -1127,6 +1159,12 @@ function CarniceriaApp() {
     if ((tab === 'resumen' || tab === 'stock' || tab === 'gastos') && cuentaConectada && excelFile) cargarResumenExcel();
   }, [tab, semExcelActual, excelFile, cuentaConectada]);
 
+  // req. urgente: chequea automáticamente si hay filas huérfanas (datos sin fecha) apenas se entra
+  // a la pestaña de Compras o se conecta el Excel, para no depender de que el usuario toque "Actualizar".
+  useEffect(() => {
+    if (tab === 'compras' && cuentaConectada && excelFile) actualizarComprasDesdeExcel();
+  }, [tab, semExcelActual, excelFile, cuentaConectada]);
+
   if (!loaded) {
     return React.createElement('div', { style: { background: '#F3E9DC', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
       React.createElement('p', { style: { fontFamily: 'Inter, sans-serif', color: '#7A2331' } }, 'Cargando…'));
@@ -1174,6 +1212,7 @@ function CarniceriaApp() {
               pendientes={pendientes}
               cuentaConectada={cuentaConectada}
               excelFile={excelFile}
+              comprasHuerfanas={comprasHuerfanas}
             />
             <SectionLabel text="Dashboard diario" />
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
@@ -1315,7 +1354,7 @@ function CarniceriaApp() {
         )}
 
         {tab === 'compras' && (
-          <ComprasTab cForm={cForm} setCForm={setCForm} agregarCompra={agregarCompra} compras={compras} proveedorSummary={proveedorSummary} selectedWeek={selectedWeek} totalComprasSemana={totalComprasSemana} cSaving={cSaving} cuentaConectada={cuentaConectada} excelFile={excelFile} actualizarComprasDesdeExcel={actualizarComprasDesdeExcel} comprasSync={comprasSync} semDetectada={semDetectada} isOnline={isOnline} comprasSemanaCount={weekCompras.length} />
+          <ComprasTab cForm={cForm} setCForm={setCForm} agregarCompra={agregarCompra} compras={compras} proveedorSummary={proveedorSummary} selectedWeek={selectedWeek} totalComprasSemana={totalComprasSemana} cSaving={cSaving} cuentaConectada={cuentaConectada} excelFile={excelFile} actualizarComprasDesdeExcel={actualizarComprasDesdeExcel} comprasSync={comprasSync} semDetectada={semDetectada} isOnline={isOnline} comprasSemanaCount={weekCompras.length} comprasHuerfanas={comprasHuerfanas} />
         )}
 
         {tab === 'stock' && (
@@ -1379,8 +1418,9 @@ function WeekPicker({ selectedWeek, setSelectedWeek }) {
   );
 }
 
-function EstadoDeHoy({ dashData, dashEstado, dashHora, resumenExcel, resumenExcelEstado, pendientes, cuentaConectada, excelFile }) {
-  const hayError = dashEstado === 'error' || resumenExcelEstado === 'error';
+function EstadoDeHoy({ dashData, dashEstado, dashHora, resumenExcel, resumenExcelEstado, pendientes, cuentaConectada, excelFile, comprasHuerfanas }) {
+  const huerfanasCount = (comprasHuerfanas || []).length;
+  const hayError = dashEstado === 'error' || resumenExcelEstado === 'error' || huerfanasCount > 0;
   const gastosSemana = resumenExcel ? resumenExcel.gastosOperativos : null;
   const horaTxt = dashHora ? dashHora.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) : '—';
   if (!cuentaConectada || !excelFile) {
@@ -1408,6 +1448,11 @@ function EstadoDeHoy({ dashData, dashEstado, dashHora, resumenExcel, resumenExce
       <div style={{ marginTop: 10, paddingTop: 8, borderTop: '1px dashed #E4D8C7', fontFamily: 'Inter, sans-serif', fontSize: 11, color: '#8A7C6B' }}>
         Última sincronización: {horaTxt}
       </div>
+      {huerfanasCount > 0 && (
+        <div style={{ marginTop: 8, fontFamily: 'Inter, sans-serif', fontSize: 11, color: '#8A3423', fontWeight: 600 }}>
+          ⚠️ {huerfanasCount} fila{huerfanasCount === 1 ? '' : 's'} de Compras con datos pero sin fecha — revisalas en la pestaña Compras.
+        </div>
+      )}
     </div>
   );
 }
@@ -1794,7 +1839,7 @@ function AjustesTab({ excelFile, setExcelFile, semExcelActual, setSemExcelActual
 
 const CAPACIDAD_COMPRAS_SEMANA = 40;
 
-function ComprasTab({ cForm, setCForm, agregarCompra, compras, proveedorSummary, selectedWeek, totalComprasSemana, cSaving, cuentaConectada, excelFile, actualizarComprasDesdeExcel, comprasSync, semDetectada, isOnline, comprasSemanaCount }) {
+function ComprasTab({ cForm, setCForm, agregarCompra, compras, proveedorSummary, selectedWeek, totalComprasSemana, cSaving, cuentaConectada, excelFile, actualizarComprasDesdeExcel, comprasSync, semDetectada, isOnline, comprasSemanaCount, comprasHuerfanas }) {
   const set = (field) => (e) => setCForm((p) => ({ ...p, [field]: e.target.value }));
   const total = cForm.modo === 'importe' ? parseImporte(cForm.importe) : parseCantidad(cForm.kg) * parseImporte(cForm.precioKg);
   const puedeGuardar = !cSaving;
@@ -1802,6 +1847,21 @@ function ComprasTab({ cForm, setCForm, agregarCompra, compras, proveedorSummary,
   return (
     <div style={styles.screen}>
       <SectionLabel text="Cargar compra" />
+      {comprasHuerfanas && comprasHuerfanas.length > 0 && (
+        <div style={{ background: '#F4D9D3', border: '1px solid #C0392B', borderRadius: 8, padding: '10px 12px', marginBottom: 10 }}>
+          <div style={{ fontFamily: 'Inter, sans-serif', fontSize: 12, fontWeight: 700, color: '#8A3423', marginBottom: 4 }}>
+            ⚠️ {comprasHuerfanas.length} fila{comprasHuerfanas.length === 1 ? '' : 's'} con datos pero sin fecha
+          </div>
+          {comprasHuerfanas.map((h) => (
+            <div key={h.row} style={{ fontFamily: 'Inter, sans-serif', fontSize: 11, color: '#8A3423' }}>
+              Fila {h.row}: {h.proveedor || '(sin proveedor)'} {h.descripcion ? `— ${h.descripcion}` : ''} {h.observaciones ? `(obs: ${h.observaciones})` : ''}
+            </div>
+          ))}
+          <div style={{ fontFamily: 'Inter, sans-serif', fontSize: 11, color: '#8A3423', marginTop: 4 }}>
+            Esto suele pasar cuando una compra se guardó a medias por un corte de conexión. Revisá esa fila directamente en el Excel: si los datos son correctos, solo le falta la fecha (completala a mano); si están mezclados o repetidos, borralos y volvé a cargar la compra desde la app.
+          </div>
+        </div>
+      )}
       <div style={{
         display: 'flex', justifyContent: 'space-between', alignItems: 'center',
         background: disponibles <= 4 ? '#F4D9D3' : '#FFFFFF', border: '1px solid #E4D8C7', borderRadius: 8,
