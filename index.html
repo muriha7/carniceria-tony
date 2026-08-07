@@ -56,15 +56,7 @@ import { Home, TrendingUp, ShoppingCart, Package, Plus, Trash2, ChevronLeft, Che
 // ============================================================
 const MSAL_CLIENT_ID = '169c0050-01d1-47a6-a750-30b4aef52d9e';
 const MSAL_TENANT_ID = '5fbce2d1-0aee-4ab3-ba1c-f8f27fe66cea';
-// Antes esto era una URL fija (la de GitHub Pages), así que sin importar desde dónde entraras a
-// la app (GitHub Pages, Netlify, o cualquier otro lugar), Microsoft SIEMPRE te devolvía a esa
-// URL fija después del login — si esa dirección estaba caída (como pasó hoy), el login quedaba
-// roto aunque la app funcionara perfecto desde otro lado. Ahora se arma con la dirección actual
-// del navegador, así el login siempre vuelve adonde realmente estás usando la app.
-// IMPORTANTE: cada dirección desde la que se use la app (GitHub Pages, Netlify, etc.) tiene que
-// estar agregada como "Redirect URI" en el App Registration de Azure — si no, Microsoft va a
-// rechazar el login con un error de "dirección no autorizada" en vez de este 404.
-const MSAL_REDIRECT_URI = window.location.origin + window.location.pathname;
+const MSAL_REDIRECT_URI = 'https://muriha7.github.io/carniceria-tony/';
 
 const pca = (() => {
   try {
