@@ -728,21 +728,22 @@ async function excelLeerVentasTotales(fileId, semSheet) {
   return num(r.values && r.values[0] && r.values[0][0]);
 }
 // Lee "Cuentas por Cobrar" (todas las semanas) y arma tanto el total pendiente como el detalle
-// por cliente. La columna que de verdad indica si un cliente ya fue cobrado es F (SEMANA DE
-// COBRO): un cliente deja de contar como pendiente recién cuando esa columna tiene algo cargado,
-// ya sea a mano acá o automáticamente desde el check de "¿Cobrado?" en Ventas (ver
-// excelSyncClientesCobrados más abajo). La columna E (¿COBRADO?) de la hoja de Ventas es aparte:
-// es la copia informativa de ese check para esa semana puntual, y no se lee acá.
+// por cliente. Desde que se sacó la columna "Proveedor Asignado" (no la usaba ninguna fórmula
+// del libro), las columnas corridas un lugar a la izquierda: la que de verdad indica si un
+// cliente ya fue cobrado es D (¿COBRADO?, antes E) — vale "SI" cuando ya pagó. La columna E
+// (SEMANA DE COBRO, antes F) NO sirve para esto: en la práctica viene completa en todas las
+// filas (parece copiar la semana de venta por defecto), así que nunca está vacía ni siquiera en
+// clientes que todavía deben. F (OBSERVACIONES, antes G) es una copia de D y tampoco se usa acá.
 async function excelLeerClientesPendientes(fileId) {
-  const r = await excelReadRange(fileId, 'Cuentas por Cobrar', 'A4:G200');
+  const r = await excelReadRange(fileId, 'Cuentas por Cobrar', 'A4:F200');
   let total = 0;
   const lista = [];
   for (const row of (r.values || [])) {
     const cliente = row[0];
     const semanaVenta = row[1];
     const monto = num(row[2]);
-    const semanaCobro = row[5]; // F: SEMANA DE COBRO
-    const yaCobrado = semanaCobro !== '' && semanaCobro != null;
+    const cobrado = (row[3] || '').toString().trim().toUpperCase(); // D: ¿COBRADO?
+    const yaCobrado = cobrado === 'SI' || cobrado === 'SÍ';
     if (cliente && monto > 0 && !yaCobrado) {
       total += monto;
       lista.push({ cliente, semana: semanaVenta || '', monto });
@@ -752,30 +753,29 @@ async function excelLeerClientesPendientes(fileId) {
 }
 
 // Cuando en Ventas se tilda "¿Cobrado?" para un cliente especial, además de guardar esa marca
-// informativa en la hoja de Ventas (columna E), esto busca la fila de ese mismo cliente y esa
-// misma semana en "Cuentas por Cobrar" y le completa la columna F (SEMANA DE COBRO) — que es la
-// que de verdad lo saca del recordatorio de cobros pendientes. Solo toca filas que coincidan en
-// nombre Y semana de venta, y solo si la columna F todavía está vacía (si ya tenía algo cargado
-// a mano, no se pisa).
+// informativa en la hoja de Ventas, esto busca la fila de ese mismo cliente y esa misma semana
+// en "Cuentas por Cobrar" y le pone "SI" en la columna D (¿COBRADO?) — que es la que de verdad
+// lo saca del recordatorio de cobros pendientes. Solo toca filas que coincidan en nombre Y
+// semana de venta, y solo si esa columna todavía no dice "SI" (si ya estaba marcada, no se toca).
 async function excelSyncClientesCobrados(fileId, semSheet, clientes) {
   const nombresCobrados = (clientes || [])
     .filter((c) => c.cobrado && (c.nombre || '').trim())
     .map((c) => c.nombre.trim().toLowerCase());
   if (nombresCobrados.length === 0) return { filas: [] };
 
-  const r = await excelReadRange(fileId, 'Cuentas por Cobrar', 'A4:G200');
+  const r = await excelReadRange(fileId, 'Cuentas por Cobrar', 'A4:F200');
   const filas = [];
   (r.values || []).forEach((row, i) => {
     const cliente = (row[0] || '').trim().toLowerCase();
     const semanaVenta = row[1];
-    const semanaCobroActual = row[5]; // F: SEMANA DE COBRO
-    const yaTieneSemanaCobro = semanaCobroActual !== '' && semanaCobroActual != null;
-    if (cliente && nombresCobrados.includes(cliente) && semanaVenta === semSheet && !yaTieneSemanaCobro) {
+    const cobradoActual = (row[3] || '').toString().trim().toUpperCase();
+    const yaMarcado = cobradoActual === 'SI' || cobradoActual === 'SÍ';
+    if (cliente && nombresCobrados.includes(cliente) && semanaVenta === semSheet && !yaMarcado) {
       filas.push(4 + i); // el rango leído arranca en la fila 4, así que la fila real es 4 + índice
     }
   });
   if (filas.length === 0) return { filas: [] };
-  await Promise.all(filas.map((fila) => excelWriteVerificado(fileId, 'Cuentas por Cobrar', `F${fila}:F${fila}`, [['SI']])));
+  await Promise.all(filas.map((fila) => excelWriteVerificado(fileId, 'Cuentas por Cobrar', `D${fila}:D${fila}`, [['SI']])));
   return { filas };
 }
 
@@ -1835,7 +1835,7 @@ function RecordatorioCobros({ lista, estado }) {
               <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: 12.5, fontWeight: 600, color: '#8A3423' }}>{fmt(c.monto)}</span>
             </div>
           ))}
-          <p style={{ fontFamily: 'Inter, sans-serif', fontSize: 10.5, color: '#B05A4D', marginTop: 8, marginBottom: 0 }}>Solo a modo de recordatorio — no afecta el rinde de la semana. Un cliente sale de esta lista cuando tildás "¿Cobrado?" en Ventas o completás a mano "Semana de Cobro" en Cuentas por Cobrar.</p>
+          <p style={{ fontFamily: 'Inter, sans-serif', fontSize: 10.5, color: '#B05A4D', marginTop: 8, marginBottom: 0 }}>Solo a modo de recordatorio — no afecta el rinde de la semana. Un cliente sale de esta lista cuando tildás "¿Cobrado?" en Ventas o ponés "SI" a mano en la columna ¿COBRADO? de Cuentas por Cobrar.</p>
         </div>
       )}
     </div>
