@@ -576,7 +576,9 @@ async function excelDeshacerCompra(fileId, semSheet, row, fechaSerialEsperada) {
     throw new Error('Esa fila ya fue modificada después de cargarla — no se puede deshacer automáticamente. Corregila a mano en el Excel.');
   }
   await Promise.all([
-    excelWriteVerificado(fileId, ws, `B${row}:H${row}`, [['', '', '', '', '', '', '']]),
+    // C (Día) e I (Total $) son fórmulas: no se tocan, solo se vacían las columnas de carga.
+    excelWriteVerificado(fileId, ws, `B${row}:B${row}`, [['']]),
+    excelWriteVerificado(fileId, ws, `D${row}:H${row}`, [['', '', '', '', '']]),
     excelWriteVerificado(fileId, ws, `J${row}:J${row}`, [['']]),
   ]);
 }
@@ -585,7 +587,7 @@ async function excelDeshacerCompra(fileId, semSheet, row, fechaSerialEsperada) {
 // Protección contra pisar compras cargadas desde la compu:
 //  1) La fila libre se busca por Fecha (B) y Proveedor (D), nunca por la columna # (A), que tiene
 //     número en todas las filas aunque estén vacías. Además se exige que el resto de los datos
-//     (C, E, F, G, H, J) esté vacío, para no mezclar con restos de una carga a medias.
+//     (E, F, G, H, J) esté vacío, para no mezclar con restos de una carga a medias.
 //  2) La "próxima fila" NO se guarda en memoria: se recalcula leyendo el Excel en cada carga.
 //     Si un reintento trae una fila asignada de antes, solo se usa para ver si ESTA misma compra
 //     ya quedó grabada ahí (para no duplicarla); si en esa fila hay otra cosa, se busca otra.
@@ -597,7 +599,7 @@ const celdaVacia = (v) => v === '' || v == null;
 function filaCompraLibre(f) {
   f = f || [];
   if (!celdaVacia(f[0]) || !celdaVacia(f[2])) return false; // Fecha o Proveedor ocupados
-  return [1, 3, 4, 5, 6, 8].every((i) => celdaVacia(f[i]));
+  return [3, 4, 5, 6, 8].every((i) => celdaVacia(f[i])); // C e I son fórmulas: no cuentan
 }
 function filaEsEstaCompra(f, compra) {
   f = f || [];
@@ -654,18 +656,14 @@ async function excelSyncCompra(fileId, semSheet, compra, filaAsignada, onRowAssi
   // observación — que es lo que se vio en la compra de Cumpa. Como son rangos que no se pisan
   // entre sí (B:H por un lado, J por otro — I nunca se toca, tiene la fórmula del Total), no hay
   // ningún problema en mandarlas juntas.
+  // Solo se escriben las columnas de carga: Fecha (B), Proveedor..Precio (D:H) y Observaciones (J).
+  // C (Día) e I (Total $) tienen fórmula en el Excel y NUNCA se tocan, para no reemplazarlas.
   const escrituras = [];
-  if (compra.modo === 'importe') {
-    escrituras.push(excelWriteVerificado(fileId, ws, `B${row}:H${row}`, [[
-      toExcelSerial(compra.fecha), DIAS_NOMBRE[weekdayIdx(compra.fecha)],
-      compra.proveedor, compra.descripcion || '', compra.tipo, parseImporte(compra.importe), '',
-    ]]));
-  } else {
-    escrituras.push(excelWriteVerificado(fileId, ws, `B${row}:H${row}`, [[
-      toExcelSerial(compra.fecha), DIAS_NOMBRE[weekdayIdx(compra.fecha)],
-      compra.proveedor, compra.descripcion || '', compra.tipo, parseCantidad(compra.kg), parseImporte(compra.precioKg),
-    ]]));
-  }
+  const datosDH = compra.modo === 'importe'
+    ? [compra.proveedor, compra.descripcion || '', compra.tipo, parseImporte(compra.importe), '']
+    : [compra.proveedor, compra.descripcion || '', compra.tipo, parseCantidad(compra.kg), parseImporte(compra.precioKg)];
+  escrituras.push(excelWriteVerificado(fileId, ws, `B${row}:B${row}`, [[toExcelSerial(compra.fecha)]]));
+  escrituras.push(excelWriteVerificado(fileId, ws, `D${row}:H${row}`, [datosDH]));
   escrituras.push(excelWriteVerificado(fileId, ws, `J${row}:J${row}`, [[compra.observaciones || '']]));
   await Promise.all(escrituras);
   return row;
