@@ -818,6 +818,40 @@ async function excelLeerClientesPendientes(fileId) {
   return { total, lista };
 }
 
+// ---------- deudas de meses anteriores ----------
+// "Carniceria_NOVIEMBRE_26.xlsx" -> "NOVIEMBRE 26"
+function etiquetaArchivo(name) {
+  return String(name || '').replace(/\.xlsx$/i, '').replace(/^carnicer[ií]a[_\s-]*/i, '').replace(/_/g, ' ').trim() || String(name || '');
+}
+// Marca un cliente especial como cobrado (SI) o LEMON en la hoja Ventas de la semana donde se hizo la
+// venta, en el archivo del mes que corresponda (puede ser un mes anterior al conectado). Así el cobro
+// impacta en ESA semana y ESE mes (sube el Rinde neto, baja el Faltante por cobrar), nunca en el mes nuevo.
+// Busca la fila por nombre del cliente + monto (efect. + transfe) entre los clientes todavía no cobrados.
+async function excelMarcarCobroDeuda(fileId, semana, cliente, monto, marca) {
+  const ws = `${semana} — Ventas`;
+  const layout = await detectarLayoutVentas(fileId, ws);
+  const r = await excelReadRange(fileId, ws, `A${layout.cliIni}:AC${layout.cliFin}`);
+  const filas = r.values || [];
+  const buscado = String(cliente || '').trim().toLowerCase();
+  const encontrados = [];
+  filas.forEach((row, i) => {
+    for (const block of BLOCK_COLS.slice(0, 6)) { // Lun a Sáb (el domingo no tiene clientes especiales)
+      const o = block - 1;
+      const nombre = String(row[o] || '').trim().toLowerCase();
+      const total = num(row[o + 1]) + num(row[o + 2]);
+      if (nombre && nombre === buscado && Math.abs(total - num(monto)) < 0.01 && !estaCobrado(row[o + 3])) {
+        encontrados.push(`${colLetter(block + 3)}${layout.cliIni + i}`);
+      }
+    }
+  });
+  if (encontrados.length === 0) {
+    throw new Error(`No encontré a "${cliente}" por ${fmt(monto)} sin cobrar en "${ws}". Marcalo a mano en el Excel.`);
+  }
+  const celda = encontrados[0];
+  await excelWriteVerificado(fileId, ws, `${celda}:${celda}`, [[marca]]);
+  return { celda, ws };
+}
+
 // Cuando en Ventas se tilda "¿Cobrado?" para un cliente especial, además de guardar esa marca
 // informativa en la hoja de Ventas, esto busca la fila de ese mismo cliente y esa misma semana
 // en "Cuentas por Cobrar" y le pone "SI" en la columna D (¿COBRADO?) — que es la que de verdad
@@ -985,6 +1019,7 @@ function CarniceriaApp() {
   // y de ahí en más TODA la app la usa en vez de una lista fija — así un archivo de 4 semanas
   // sigue funcionando exactamente igual que siempre, y uno de 5 incluye la quinta en todo.
   const [semanasActivas, setSemanasActivas] = useState(SEMANAS_EXCEL_BASE);
+  const [mesesAnteriores, setMesesAnteriores] = useState([]); // archivos de meses anteriores que todavía tienen clientes por cobrar
   const [cuentaConectada, setCuentaConectada] = useState(null);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   useEffect(() => {
@@ -1030,6 +1065,8 @@ function CarniceriaApp() {
     if (reg) setRegistro(reg);
     const lc = storage.get('carniceria_log_compras');
     if (lc) setLogCompras(lc);
+    const ma = storage.get('carniceria_meses_anteriores');
+    if (ma) setMesesAnteriores(ma);
     if (v) setVentas(v);
     if (c) setCompras(c);
     if (p) setPesada(p);
@@ -1063,6 +1100,7 @@ function CarniceriaApp() {
   useEffect(() => { if (loaded) storage.set('carniceria_pendientes', pendientes); }, [pendientes, loaded]);
   useEffect(() => { if (loaded) storage.set('carniceria_registro', registro); }, [registro, loaded]);
   useEffect(() => { if (loaded) storage.set('carniceria_log_compras', logCompras); }, [logCompras, loaded]);
+  useEffect(() => { if (loaded) storage.set('carniceria_meses_anteriores', mesesAnteriores); }, [mesesAnteriores, loaded]);
 
   const semExcelActual = semExcelMap[selectedWeek] || 'Sem1';
   const setSemExcelActual = (val) => setSemExcelMap((prev) => ({ ...prev, [selectedWeek]: val }));
@@ -1556,6 +1594,23 @@ function CarniceriaApp() {
     if (tab === 'resumen' && cuentaConectada && excelFile) cargarDashboardDiario();
   }, [tab, dashDate, excelFile, cuentaConectada]);
 
+  const cobrarDeuda = async (item, marca) => {
+    if (!isOnline || !cuentaConectada) { setSyncMsg({ type: 'error', text: 'Necesitás conexión y Excel conectado para marcar el cobro.' }); return false; }
+    const opId = 'cobro-' + Date.now();
+    try {
+      setSyncMsg({ type: 'loading', text: `Marcando ${item.cliente} como ${marca === 'LEMON' ? 'Lemon' : 'cobrado'}…` });
+      const { celda, ws } = await conLock(() => excelMarcarCobroDeuda(item.fileId, item.semana, item.cliente, item.monto, marca));
+      const donde = item.mes ? `${item.mes}, ${ws}` : ws;
+      setSyncMsg({ type: 'ok', text: `${item.cliente} marcado ${marca} en ${donde} (celda ${celda}) ✓` });
+      registrar({ tipo: 'cobro', hoja: 'Ventas', rango: `${item.mes ? item.mes + ' · ' : ''}${item.semana} ${celda} = ${marca} (${item.cliente} ${fmt(item.monto)})`, estado: 'confirmado', opId });
+      await cargarResumenExcel();
+      return true;
+    } catch (e) {
+      setSyncMsg({ type: 'error', text: 'No se pudo marcar el cobro: ' + e.message });
+      return false;
+    }
+  };
+
   const cargarResumenExcel = async () => {
     if (!cuentaConectada || !excelFile) return;
     setResumenExcelEstado('loading');
@@ -1569,7 +1624,25 @@ function CarniceriaApp() {
         ]);
         return { r, ventasTotales, pendientes };
       });
-      setResumenExcel({ ...r, ventasTotales, clientesPendientes: pendientes.total, clientesPendientesLista: pendientes.lista, resultado: ventasTotales - r.totalCompras });
+      // Deudores de meses anteriores: se leen aparte (si uno falla, no frena el resumen del mes).
+      const anteriores = (mesesAnteriores || []).filter((m) => m.id !== excelFile.id);
+      const leidos = await Promise.allSettled(anteriores.map((m) => excelLeerClientesPendientes(m.id)));
+      const listaAnteriores = [];
+      const sinDeuda = [];
+      const conError = [];
+      leidos.forEach((res, i) => {
+        const m = anteriores[i];
+        if (res.status === 'fulfilled') {
+          if (res.value.lista.length === 0) sinDeuda.push(m.id);
+          res.value.lista.forEach((c) => listaAnteriores.push({ ...c, fileId: m.id, mes: etiquetaArchivo(m.name) }));
+        } else {
+          conError.push(etiquetaArchivo(m.name));
+        }
+      });
+      // Un mes que ya no tiene nada por cobrar se deja de leer solo.
+      if (sinDeuda.length) setMesesAnteriores((prev) => prev.filter((m) => !sinDeuda.includes(m.id)));
+      const listaActual = pendientes.lista.map((c) => ({ ...c, fileId: excelFile.id, mes: null }));
+      setResumenExcel({ ...r, ventasTotales, clientesPendientes: pendientes.total, clientesPendientesLista: [...listaActual, ...listaAnteriores], mesesConError: conError, resultado: ventasTotales - r.totalCompras });
       setResumenExcelHora(new Date());
       setResumenExcelEstado('ok');
     } catch (e) {
@@ -1758,7 +1831,7 @@ function CarniceriaApp() {
               </div>
             </div>
 
-            <RecordatorioCobros lista={resumenExcel ? resumenExcel.clientesPendientesLista : null} estado={resumenExcelEstado} />
+            <RecordatorioCobros lista={resumenExcel ? resumenExcel.clientesPendientesLista : null} estado={resumenExcelEstado} onCobrar={cobrarDeuda} mesesConError={resumenExcel ? resumenExcel.mesesConError : []} />
           </div>
         )}
 
@@ -1795,6 +1868,7 @@ function CarniceriaApp() {
             selectedWeek={selectedWeek} setSyncMsg={setSyncMsg}
             pendientes={pendientes} reintentarPendiente={reintentarPendiente} quitarPendiente={quitarPendiente}
             registro={registro} semDetectada={semDetectada} isOnline={isOnline} logCompras={logCompras}
+            mesesAnteriores={mesesAnteriores} setMesesAnteriores={setMesesAnteriores}
             sincronizarPendientes={sincronizarPendientes} deshacerEntrada={deshacerEntrada}
           />
         )}
@@ -1888,7 +1962,9 @@ function EstadoItem({ label, value, warn }) {
 // del mes (no solo la que estás trabajando ahora). Sale de "Cuentas por Cobrar", que ya lista
 // solo pendientes reales (un cliente sale de esta lista recién cuando se le completa la Semana
 // de Cobro en esa hoja). Es puramente informativo — no participa de ningún cálculo de rinde.
-function RecordatorioCobros({ lista, estado }) {
+function RecordatorioCobros({ lista, estado, onCobrar, mesesConError }) {
+  const [confirmar, setConfirmar] = useState(null); // { key, marca }
+  const [trabajando, setTrabajando] = useState(null);
   if (estado === 'loading' && !lista) {
     return (
       <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px dashed #E4D8C7' }}>
@@ -1899,25 +1975,64 @@ function RecordatorioCobros({ lista, estado }) {
   }
   if (!lista) return null; // todavía no cargó nada (sin Excel conectado, etc.)
   const total = lista.reduce((a, c) => a + c.monto, 0);
+  const keyDe = (c) => `${c.fileId}|${c.semana}|${c.cliente}|${c.monto}`;
+  const ejecutar = async (c, marca) => {
+    const k = keyDe(c);
+    setTrabajando(k);
+    await onCobrar(c, marca);
+    setTrabajando(null);
+    setConfirmar(null);
+  };
+  const btn = { fontFamily: 'Inter, sans-serif', fontSize: 11, padding: '5px 9px', borderRadius: 6, border: '1px solid #C0392B', background: '#FFFFFF', color: '#8A3423', cursor: 'pointer' };
   return (
     <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px dashed #E4D8C7' }}>
-      <SectionLabel text="🚨 Recordatorio: cobros pendientes (todo el mes)" />
+      <SectionLabel text="🚨 Recordatorio: cobros pendientes" />
       {lista.length === 0 ? (
-        <p style={{ fontFamily: 'Inter, sans-serif', fontSize: 12, color: '#3B5C2A' }}>No hay clientes especiales pendientes de cobro en ninguna semana del mes. ✓</p>
+        <p style={{ fontFamily: 'Inter, sans-serif', fontSize: 12, color: '#3B5C2A' }}>No hay clientes especiales pendientes de cobro, ni de este mes ni de meses anteriores. ✓</p>
       ) : (
         <div style={{ background: '#F4D9D3', border: '1px solid #C0392B', borderRadius: 12, padding: '12px 14px' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
             <span style={{ fontFamily: 'Inter, sans-serif', fontSize: 11, fontWeight: 700, color: '#8A3423', textTransform: 'uppercase', letterSpacing: 0.5 }}>⚠️ {lista.length} pendiente{lista.length === 1 ? '' : 's'}</span>
             <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: 14, fontWeight: 700, color: '#8A3423' }}>{fmt(total)}</span>
           </div>
-          {lista.map((c, i) => (
-            <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderTop: i > 0 ? '1px solid #E3A99C' : 'none' }}>
-              <span style={{ fontFamily: 'Inter, sans-serif', fontSize: 12.5, color: '#8A3423' }}>{c.cliente} <span style={{ color: '#B05A4D', fontSize: 11 }}>({c.semana})</span></span>
-              <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: 12.5, fontWeight: 600, color: '#8A3423' }}>{fmt(c.monto)}</span>
-            </div>
-          ))}
-          <p style={{ fontFamily: 'Inter, sans-serif', fontSize: 10.5, color: '#B05A4D', marginTop: 8, marginBottom: 0 }}>Solo a modo de recordatorio — no afecta el rinde de la semana. Un cliente sale de esta lista cuando tildás "¿Cobrado?" en Ventas o ponés "SI" a mano en la columna ¿COBRADO? de Cuentas por Cobrar.</p>
+          {lista.map((c, i) => {
+            const k = keyDe(c);
+            const conf = confirmar && confirmar.key === k ? confirmar.marca : null;
+            const ocupado = trabajando === k;
+            return (
+              <div key={k + i} style={{ padding: '7px 0', borderTop: i > 0 ? '1px solid #E3A99C' : 'none' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                  <span style={{ fontFamily: 'Inter, sans-serif', fontSize: 12.5, color: '#8A3423' }}>
+                    {c.cliente} <span style={{ color: '#B05A4D', fontSize: 11 }}>({c.mes ? `${c.mes} · ` : ''}{c.semana})</span>
+                  </span>
+                  <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: 12.5, fontWeight: 600, color: '#8A3423', whiteSpace: 'nowrap' }}>{fmt(c.monto)}</span>
+                </div>
+                {onCobrar && (
+                  <div style={{ display: 'flex', gap: 6, marginTop: 5, alignItems: 'center', flexWrap: 'wrap' }}>
+                    {ocupado ? (
+                      <span style={{ fontFamily: 'Inter, sans-serif', fontSize: 11, color: '#8A3423' }}>Marcando…</span>
+                    ) : conf ? (
+                      <>
+                        <span style={{ fontFamily: 'Inter, sans-serif', fontSize: 11, color: '#8A3423' }}>¿Marcar {conf === 'LEMON' ? 'Lemon' : 'cobrado'} en {c.mes || 'este mes'} {c.semana}?</span>
+                        <button onClick={() => ejecutar(c, conf)} style={{ ...btn, background: '#8A3423', color: '#FFFFFF' }}>Sí, marcar</button>
+                        <button onClick={() => setConfirmar(null)} style={btn}>No</button>
+                      </>
+                    ) : (
+                      <>
+                        <button onClick={() => setConfirmar({ key: k, marca: 'LEMON' })} style={btn}>Cobré → Lemon</button>
+                        <button onClick={() => setConfirmar({ key: k, marca: 'SI' })} style={btn}>Cobré → Caja</button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <p style={{ fontFamily: 'Inter, sans-serif', fontSize: 10.5, color: '#B05A4D', marginTop: 8, marginBottom: 0 }}>Al marcar un cobro, la app lo anota en la semana y el mes donde se hizo la venta (no en el mes actual): sube el Rinde neto de esa semana y baja su Faltante por cobrar. Lo de meses anteriores aparece con el nombre del mes.</p>
         </div>
+      )}
+      {mesesConError && mesesConError.length > 0 && (
+        <p style={{ fontFamily: 'Inter, sans-serif', fontSize: 11, color: '#7A5B23', marginTop: 6 }}>No pude leer las deudas de: {mesesConError.join(', ')}. Revisá en Ajustes que el archivo siga existiendo.</p>
       )}
     </div>
   );
@@ -2154,7 +2269,7 @@ function VentasTab({ vDate, setVDate, vTurno, setVTurno, vForm, setVForm, vDeliv
   );
 }
 
-function AjustesTab({ excelFile, setExcelFile, semExcelActual, setSemExcelActual, cuentaConectada, conectarExcel, desconectarExcel, selectedWeek, setSyncMsg, pendientes, reintentarPendiente, quitarPendiente, registro, logCompras, semDetectada, isOnline, sincronizarPendientes, deshacerEntrada, semanasActivas, setSemanasActivas }) {
+function AjustesTab({ excelFile, setExcelFile, semExcelActual, setSemExcelActual, cuentaConectada, conectarExcel, desconectarExcel, selectedWeek, setSyncMsg, pendientes, reintentarPendiente, quitarPendiente, registro, logCompras, mesesAnteriores, setMesesAnteriores, semDetectada, isOnline, sincronizarPendientes, deshacerEntrada, semanasActivas, setSemanasActivas }) {
   const [busqueda, setBusqueda] = useState('');
   const [candidatos, setCandidatos] = useState(null);
   const [buscando, setBuscando] = useState(false);
@@ -2171,6 +2286,21 @@ function AjustesTab({ excelFile, setExcelFile, semExcelActual, setSemExcelActual
       setSyncMsg({ type: 'error', text: 'Error buscando: ' + e.message });
     }
     setBuscando(false);
+  };
+
+  const agregarAnterior = async (item) => {
+    if (excelFile && excelFile.id === item.id) { setSyncMsg({ type: 'error', text: 'Ese es el archivo del mes actual.' }); return; }
+    setVerificando(true);
+    try {
+      await conProgreso(setSyncMsg, 'Revisando el archivo', () => conReintentoAuto(() => verificarEstructuraArchivo(item.id), 2, 1500));
+      setMesesAnteriores((prev) => [{ id: item.id, name: item.name, path: item.path }, ...prev.filter((m) => m.id !== item.id)]);
+      setCandidatos(null);
+      setBusqueda('');
+      setSyncMsg({ type: 'ok', text: `${item.name} agregado como mes anterior: sus deudores van a aparecer en el recordatorio.` });
+    } catch (e) {
+      setSyncMsg({ type: 'error', text: 'No pude agregar ese archivo: ' + ((e && e.message) || '').replace('PLANTILLA_INCOMPATIBLE: ', '') });
+    }
+    setVerificando(false);
   };
 
   const elegir = async (item) => {
@@ -2192,6 +2322,13 @@ function AjustesTab({ excelFile, setExcelFile, semExcelActual, setSemExcelActual
       // notar nada ni tocar "conectar" de nuevo a mano.
       const semanas = await conProgreso(setSyncMsg, 'Revisando el archivo', () =>
         conReintentoAuto(() => verificarEstructuraArchivo(item.id), 2, 1500));
+      // Al cambiar de mes, el archivo anterior pasa a "meses anteriores" para no perder sus deudores.
+      if (excelFile && excelFile.id !== item.id) {
+        const anterior = { id: excelFile.id, name: excelFile.name, path: excelFile.path };
+        setMesesAnteriores((prev) => [anterior, ...prev.filter((m) => m.id !== anterior.id && m.id !== item.id)]);
+      } else {
+        setMesesAnteriores((prev) => prev.filter((m) => m.id !== item.id));
+      }
       setExcelFile(item);
       setSemanasActivas(semanas);
       setCandidatos(null);
@@ -2256,16 +2393,30 @@ function AjustesTab({ excelFile, setExcelFile, semExcelActual, setSemExcelActual
           <div style={{ marginTop: 8 }}>
             {candidatos.map((c) => (
               <div key={c.id} onClick={() => !verificando && elegir(c)} style={{ ...styles.listRow, cursor: verificando ? 'default' : 'pointer', opacity: verificando ? 0.6 : 1 }}>
-                <div>
+                <div style={{ flex: 1 }}>
                   <div style={{ fontFamily: 'Inter, sans-serif', fontSize: 13, fontWeight: 600 }}>{c.name}</div>
                   <div style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: 10, color: '#8A7C6B', wordBreak: 'break-all' }}>{c.path}</div>
                 </div>
+                {excelFile && excelFile.id !== c.id && (
+                  <button onClick={(e) => { e.stopPropagation(); if (!verificando) agregarAnterior(c); }} style={{ ...styles.segBtn, padding: '4px 8px', fontSize: 10.5, whiteSpace: 'nowrap' }}>+ Mes anterior</button>
+                )}
               </div>
             ))}
             {verificando && <p style={{ fontFamily: 'Inter, sans-serif', fontSize: 12, color: '#7A5B23' }}>Revisando hojas y rangos…</p>}
           </div>
         )}
         <p style={styles.footnote}>La app nunca elige un archivo sola: siempre lo seleccionás vos de la lista. Antes de conectarlo, revisa que tenga las semanas Sem1 a Sem4 (Pesada/Ventas/Compras/Resumen) y la hoja Cuentas por Cobrar. Si el mes tiene una Sem5 completa, la app la detecta sola — no hace falta nada especial.</p>
+
+        <div style={styles.fieldGroupLabel}>Meses anteriores con clientes por cobrar</div>
+        {(mesesAnteriores || []).length === 0 ? (
+          <p style={{ fontFamily: 'Inter, sans-serif', fontSize: 12, color: '#8A7C6B' }}>Ninguno. Cuando cambies al archivo del mes nuevo, el anterior se agrega solo acá mientras tenga deudores.</p>
+        ) : (mesesAnteriores || []).map((m) => (
+          <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#F0E6D2', border: '1px solid #E4D8C7', borderRadius: 8, padding: 8, marginBottom: 6 }}>
+            <div style={{ flex: 1, fontFamily: 'Inter, sans-serif', fontSize: 12.5, color: '#5A4E42' }}>{m.name}</div>
+            <button onClick={() => setMesesAnteriores((prev) => prev.filter((x) => x.id !== m.id))} style={styles.deleteBtn}><Trash2 size={14} /></button>
+          </div>
+        ))}
+        <p style={styles.footnote}>Para sumar un mes a mano: buscalo arriba y tocá "+ Mes anterior". Un mes sale solo de esta lista cuando ya no le queda nadie por cobrar.</p>
 
         <label style={styles.label}>Hoja del Excel para la semana actual ({fmtDate(selectedWeek)})</label>
         <select value={semExcelActual} onChange={(e) => setSemExcelActual(e.target.value)} style={styles.input}>
