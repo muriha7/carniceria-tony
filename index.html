@@ -582,26 +582,69 @@ async function excelDeshacerCompra(fileId, semSheet, row, fechaSerialEsperada) {
 }
 
 // ---------- compras: kg/unidad o importe directo, con Observaciones (req. 8) ----------
-// req. 1 y 2: rango correcto (nunca la fila 43, que es TOTAL COMPRAS), e idempotente por operationId.
-// Si la operación ya tenía una fila asignada (viene de un reintento), se reusa esa misma fila.
+// Protección contra pisar compras cargadas desde la compu:
+//  1) La fila libre se busca por Fecha (B) y Proveedor (D), nunca por la columna # (A), que tiene
+//     número en todas las filas aunque estén vacías. Además se exige que el resto de los datos
+//     (C, E, F, G, H, J) esté vacío, para no mezclar con restos de una carga a medias.
+//  2) La "próxima fila" NO se guarda en memoria: se recalcula leyendo el Excel en cada carga.
+//     Si un reintento trae una fila asignada de antes, solo se usa para ver si ESTA misma compra
+//     ya quedó grabada ahí (para no duplicarla); si en esa fila hay otra cosa, se busca otra.
+//  3) Justo antes de grabar se espera un segundo y se vuelve a leer la fila elegida. Si mientras
+//     tanto apareció algo en Fecha o Proveedor, no se escribe y se pasa a la siguiente fila vacía.
+const COMPRAS_FILA_INICIO = 3, COMPRAS_FILA_FIN = 42;
+const celdaVacia = (v) => v === '' || v == null;
+// f = valores de B..J (B=0, C=1, D=2, E=3, F=4, G=5, H=6, I=7 fórmula Total, J=8)
+function filaCompraLibre(f) {
+  f = f || [];
+  if (!celdaVacia(f[0]) || !celdaVacia(f[2])) return false; // Fecha o Proveedor ocupados
+  return [1, 3, 4, 5, 6, 8].every((i) => celdaVacia(f[i]));
+}
+function filaEsEstaCompra(f, compra) {
+  f = f || [];
+  if (num(f[0]) !== toExcelSerial(compra.fecha)) return false;
+  if (String(f[2] || '').trim().toLowerCase() !== String(compra.proveedor || '').trim().toLowerCase()) return false;
+  const igual = (a, b) => Math.abs(redondear(num(a)) - redondear(num(b))) < 0.01;
+  if (compra.modo === 'importe') return igual(f[5], parseImporte(compra.importe));
+  return igual(f[5], parseCantidad(compra.kg)) && igual(f[6], parseImporte(compra.precioKg));
+}
 async function excelSyncCompra(fileId, semSheet, compra, filaAsignada, onRowAssigned) {
   await validarFechaEnSemana(fileId, semSheet, compra.fecha);
   const ws = `${semSheet} — Compras`;
-  let row = filaAsignada;
-  if (!row) {
-    // Lee fecha (B) Y el resto de los datos (D:J): una fila solo se considera libre si TODO está
-    // vacío. Si solo mirásemos la fecha, una fila que haya quedado con datos parciales de una
-    // operación anterior interrumpida (con fecha sin escribir todavía) se vería "libre" y una
-    // compra nueva la pisaría a medias — mezclando dos compras distintas en la misma fila.
-    const rango = await excelReadRange(fileId, ws, 'B3:J42');
-    const vals = rango.values || [];
-    for (let i = 0; i < vals.length; i++) {
-      const fila = vals[i] || [];
-      const vacia = fila.every((v) => v === '' || v == null);
-      if (vacia) { row = 3 + i; break; }
+
+  // Reintento: si esta misma compra ya quedó grabada en la fila de un intento anterior (solo falló
+  // la confirmación), no se vuelve a cargar — se completa la observación y listo, sin duplicar.
+  if (filaAsignada) {
+    const prev = await excelReadRange(fileId, ws, `B${filaAsignada}:J${filaAsignada}`);
+    const f = (prev.values && prev.values[0]) || [];
+    if (filaEsEstaCompra(f, compra)) {
+      if (onRowAssigned) onRowAssigned(filaAsignada);
+      if (celdaVacia(f[8]) && compra.observaciones) {
+        await excelWriteVerificado(fileId, ws, `J${filaAsignada}:J${filaAsignada}`, [[compra.observaciones]]);
+      }
+      return filaAsignada;
     }
-    if (!row) throw new Error('No hay filas disponibles en Compras de esta semana. La capacidad máxima es de 40 compras. Si creés que hay filas con datos parciales o corruptos ocupando lugar, revisalas directamente en el Excel.');
+    // Si no es esta compra, esa fila NO se usa (puede ser una compra cargada desde la compu).
   }
+
+  let row = null;
+  const descartadas = new Set();
+  for (let intento = 0; intento < 6 && !row; intento++) {
+    const rango = await excelReadRange(fileId, ws, `B${COMPRAS_FILA_INICIO}:J${COMPRAS_FILA_FIN}`);
+    const vals = rango.values || [];
+    let candidata = null;
+    for (let i = 0; i <= COMPRAS_FILA_FIN - COMPRAS_FILA_INICIO; i++) {
+      const r = COMPRAS_FILA_INICIO + i;
+      if (descartadas.has(r)) continue;
+      if (filaCompraLibre(vals[i])) { candidata = r; break; }
+    }
+    if (!candidata) throw new Error('No hay filas libres en Compras de esta semana (capacidad: 40 compras, filas 3 a 42). Si hay filas con datos sueltos ocupando lugar, revisalas en el Excel.');
+    // Un segundo antes de grabar, se vuelve a leer la fila elegida.
+    await sleep(1000);
+    const chk = await excelReadRange(fileId, ws, `B${candidata}:J${candidata}`);
+    if (filaCompraLibre(chk.values && chk.values[0])) row = candidata;
+    else descartadas.add(candidata); // alguien la ocupó recién: se pasa a la siguiente vacía
+  }
+  if (!row) throw new Error('Las filas de Compras se están ocupando mientras se carga (¿hay alguien cargando desde la compu?). No se grabó nada para no pisar datos. Probá de nuevo en un momento.');
   if (onRowAssigned) onRowAssigned(row);
   // Fecha + datos (B:H) y Observaciones (J) se escriben EN PARALELO, no una atrás de la otra.
   // Antes iban en secuencia: primero se escribía y confirmaba B:H (lo cual, con los reintentos
@@ -937,6 +980,7 @@ function CarniceriaApp() {
   const [syncMsg, setSyncMsg] = useState(null); // {type:'ok'|'error'|'loading', text}
   const [pendientes, setPendientes] = useState([]); // operaciones que fallaron y esperan reintento
   const [registro, setRegistro] = useState([]); // req. 9: registro de actividad local
+  const [logCompras, setLogCompras] = useState([]); // lista propia de cada compra cargada desde la app (para comparar/recuperar si algo se pisa)
 
   const [darkMode, setDarkMode] = useState(() => storage.get('carniceria_dark_mode') === true);
   useEffect(() => {
@@ -967,6 +1011,8 @@ function CarniceriaApp() {
     const pend = storage.get('carniceria_pendientes');
     const reg = storage.get('carniceria_registro');
     if (reg) setRegistro(reg);
+    const lc = storage.get('carniceria_log_compras');
+    if (lc) setLogCompras(lc);
     if (v) setVentas(v);
     if (c) setCompras(c);
     if (p) setPesada(p);
@@ -999,6 +1045,7 @@ function CarniceriaApp() {
   useEffect(() => { if (loaded) storage.set('carniceria_semanas_activas', semanasActivas); }, [semanasActivas, loaded]);
   useEffect(() => { if (loaded) storage.set('carniceria_pendientes', pendientes); }, [pendientes, loaded]);
   useEffect(() => { if (loaded) storage.set('carniceria_registro', registro); }, [registro, loaded]);
+  useEffect(() => { if (loaded) storage.set('carniceria_log_compras', logCompras); }, [logCompras, loaded]);
 
   const semExcelActual = semExcelMap[selectedWeek] || 'Sem1';
   const setSemExcelActual = (val) => setSemExcelMap((prev) => ({ ...prev, [selectedWeek]: val }));
@@ -1132,6 +1179,13 @@ function CarniceriaApp() {
     return run;
   };
 
+  // Anota (o actualiza por opId) cada compra en la lista propia: fecha, proveedor, monto, hoja, fila y estado.
+  const anotarCompra = (opId, compra, semSheet, fila, estado) => setLogCompras((prev) => {
+    const base = { opId, hora: new Date().toISOString(), fecha: compra.fecha, proveedor: compra.proveedor, monto: redondear(num(compra.total)), detalle: compra.modo === 'importe' ? 'importe directo' : `${compra.kg} kg x ${compra.precioKg}`, tipo: compra.tipo || '', semana: semSheet, fila: fila || null, estado };
+    const existe = prev.some((x) => x.opId === opId);
+    const lista = existe ? prev.map((x) => x.opId === opId ? { ...x, ...base, hora: x.hora, horaConfirmado: estado === 'grabada' ? new Date().toISOString() : x.horaConfirmado } : x) : [base, ...prev];
+    return lista.slice(0, 500);
+  });
   const registrar = (entrada) => setRegistro((prev) => [{ id: Date.now().toString() + Math.random(), hora: new Date().toISOString(), usuario: cuentaConectada || '(sin conectar)', archivo: excelFile ? excelFile.name : '', semana: semExcelActual, ...entrada }, ...prev].slice(0, 200));
 
   const guardarVenta = async () => {
@@ -1219,6 +1273,7 @@ function CarniceriaApp() {
       setCForm({ fecha: cForm.fecha, modo: 'kg', proveedor: PROVEEDORES[0], proveedorOtro: '', tipo: TIPOS[0], tipoOtro: '', descripcion: '', kg: '', precioKg: '', importe: '', observaciones: '' });
       setSyncMsg({ type: 'ok', text: 'Guardado local (sin sincronizar). Se sube solo cuando vuelva la conexión.' + avisoProveedor });
       registrar({ tipo: 'compra', hoja: 'Compras', rango: '(local, sin fila asignada)', estado: 'local', opId });
+      anotarCompra(opId, compraFinal, semExcelActual, null, 'pendiente');
       guardandoCompraRef.current = false;
       setCSaving(false);
       return;
@@ -1233,10 +1288,12 @@ function CarniceriaApp() {
       setCForm({ fecha: cForm.fecha, modo: 'kg', proveedor: PROVEEDORES[0], proveedorOtro: '', tipo: TIPOS[0], tipoOtro: '', descripcion: '', kg: '', precioKg: '', importe: '', observaciones: '' });
       setSyncMsg({ type: 'ok', text: 'Compra sincronizada con el Excel ✓' + avisoProveedor });
       registrar({ tipo: 'compra', hoja: 'Compras', rango: `fila ${fila}`, estado: 'confirmado', opId, row: fila, fechaSerial: toExcelSerial(compraFinal.fecha), deshacerVenceEn: Date.now() + 5 * 60 * 1000 });
+      anotarCompra(opId, compraFinal, semExcelActual, fila, 'grabada');
     } catch (e) {
       agregarPendiente({ id: opId, tipo: 'compra', compra: compraFinal, semSheet: semExcelActual, filaAsignada: filaCapturada, error: e.message });
       setSyncMsg({ type: 'error', text: 'No se sincronizó y quedó pendiente: ' + e.message });
       registrar({ tipo: 'compra', hoja: 'Compras', rango: filaCapturada ? `fila ${filaCapturada} (sin confirmar)` : '(sin fila asignada)', estado: 'pendiente', opId, error: e.message });
+      anotarCompra(opId, compraFinal, semExcelActual, filaCapturada, 'pendiente');
     }
     guardandoCompraRef.current = false;
     setCSaving(false);
@@ -1342,6 +1399,7 @@ function CarniceriaApp() {
           return [{ id: p.id, ...p.compra, row: fila }, ...prev];
         });
         registrar({ tipo: 'compra', hoja: 'Compras', rango: `fila ${fila}`, estado: 'confirmado', opId: p.id, row: fila, fechaSerial: toExcelSerial(p.compra.fecha), deshacerVenceEn: Date.now() + 5 * 60 * 1000 });
+        anotarCompra(p.id, p.compra, p.semSheet, fila, 'grabada');
       }
       quitarPendiente(p.id);
       setSyncMsg({ type: 'ok', text: 'Sincronizado ✓' });
@@ -1719,7 +1777,7 @@ function CarniceriaApp() {
             cuentaConectada={cuentaConectada} conectarExcel={conectarExcel} desconectarExcel={desconectarExcel}
             selectedWeek={selectedWeek} setSyncMsg={setSyncMsg}
             pendientes={pendientes} reintentarPendiente={reintentarPendiente} quitarPendiente={quitarPendiente}
-            registro={registro} semDetectada={semDetectada} isOnline={isOnline}
+            registro={registro} semDetectada={semDetectada} isOnline={isOnline} logCompras={logCompras}
             sincronizarPendientes={sincronizarPendientes} deshacerEntrada={deshacerEntrada}
           />
         )}
@@ -2079,7 +2137,7 @@ function VentasTab({ vDate, setVDate, vTurno, setVTurno, vForm, setVForm, vDeliv
   );
 }
 
-function AjustesTab({ excelFile, setExcelFile, semExcelActual, setSemExcelActual, cuentaConectada, conectarExcel, desconectarExcel, selectedWeek, setSyncMsg, pendientes, reintentarPendiente, quitarPendiente, registro, semDetectada, isOnline, sincronizarPendientes, deshacerEntrada, semanasActivas, setSemanasActivas }) {
+function AjustesTab({ excelFile, setExcelFile, semExcelActual, setSemExcelActual, cuentaConectada, conectarExcel, desconectarExcel, selectedWeek, setSyncMsg, pendientes, reintentarPendiente, quitarPendiente, registro, logCompras, semDetectada, isOnline, sincronizarPendientes, deshacerEntrada, semanasActivas, setSemanasActivas }) {
   const [busqueda, setBusqueda] = useState('');
   const [candidatos, setCandidatos] = useState(null);
   const [buscando, setBuscando] = useState(false);
@@ -2207,6 +2265,29 @@ function AjustesTab({ excelFile, setExcelFile, semExcelActual, setSemExcelActual
           <p style={styles.footnote}>Antes de guardar, la app siempre chequea que la fecha esté dentro del rango de fechas cargado en esa hoja (Pesada B2:D2).</p>
         )}
       </div>
+
+      {logCompras && logCompras.length > 0 && (
+        <>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <SectionLabel text={`Compras cargadas desde la app (${logCompras.length})`} />
+            <button onClick={async () => {
+              const txt = ['Hora carga\tFecha compra\tProveedor\tMonto\tDetalle\tHoja\tFila\tEstado']
+                .concat(logCompras.map((x) => [new Date(x.hora).toLocaleString('es-AR'), x.fecha, x.proveedor, x.monto, x.detalle, x.semana, x.fila || '', x.estado].join('\t'))).join('\n');
+              try { await navigator.clipboard.writeText(txt); setSyncMsg({ type: 'ok', text: 'Lista de compras copiada. Pegala en un Excel para comparar.' }); }
+              catch (e) { setSyncMsg({ type: 'error', text: 'No se pudo copiar la lista en este dispositivo.' }); }
+            }} style={{ ...styles.segBtn, padding: '4px 10px', fontSize: 11, marginBottom: 10 }}>Copiar lista</button>
+          </div>
+          <div style={styles.formCard}>
+            {logCompras.slice(0, 30).map((x) => (
+              <div key={x.opId} style={{ borderBottom: '1px solid #E4D8C7', padding: '8px 0', fontFamily: 'Inter, sans-serif', fontSize: 11, color: '#5A4E42' }}>
+                <div><b>{fmtDate(x.fecha)} · {x.proveedor} · {fmt(x.monto)}</b></div>
+                <div>{x.semana}{x.fila ? ` · fila ${x.fila}` : ''} · cargada {new Date(x.hora).toLocaleString('es-AR')} · <b style={{ color: x.estado === 'grabada' ? '#3B5C2A' : '#8A3423' }}>{x.estado}</b></div>
+              </div>
+            ))}
+            <p style={styles.footnote}>Si una compra no aparece en el Excel o aparece con otros datos, compará con esta lista: tiene la hoja y la fila donde la app la grabó.</p>
+          </div>
+        </>
+      )}
 
       {registro.length > 0 && (
         <>
