@@ -466,12 +466,29 @@ async function validarFechaEnSemana(fileId, semSheet, dateStr) {
 }
 
 // ---------- lectura de un día completo de Ventas (para mezclar antes de escribir) ----------
+// ---------- estructura de la hoja Ventas (plantilla vieja vs. v5) ----------
+// Plantilla vieja (hasta noviembre 2026): Delivery en filas 15-19, Clientes especiales en 24-31
+//   (encabezado "CLIENTE" en A23).
+// Plantilla v5 (sin delivery): Clientes especiales en 15-22 (encabezado "CLIENTE" en A14).
+// Se detecta leyendo el encabezado cada vez, así la app funciona con los dos archivos. Si no
+// encuentra ninguno de los dos, NO escribe nada (para no pisar fórmulas de una plantilla distinta).
+async function detectarLayoutVentas(fileId, ws) {
+  const r = await excelReadRange(fileId, ws, 'A13:A23');
+  const col = (r.values || []).map((row) => String((row && row[0]) || '').trim().toUpperCase());
+  if (col[1] === 'CLIENTE') return { cliIni: 15, cliFin: 22, hayDelivery: false }; // A14 -> v5
+  if (col[10] === 'CLIENTE') return { cliIni: 24, cliFin: 31, hayDelivery: true }; // A23 -> vieja
+  throw new Error(`No reconozco la estructura de "${ws}" (no encuentro el encabezado CLIENTE en A14 ni en A23). No se grabó nada para no pisar fórmulas.`);
+}
+
 async function leerVentaDia(fileId, semSheet, dateStr) {
   const day = weekdayIdx(dateStr);
   const block = BLOCK_COLS[day];
   const c1 = colLetter(block + 1), c2 = colLetter(block + 2), c3 = colLetter(block + 3), c0 = colLetter(block);
   const ws = `${semSheet} — Ventas`;
-  const mostrador = await excelReadRange(fileId, ws, `${c1}9:${c2}10`);
+  const [mostrador, layout] = await Promise.all([
+    excelReadRange(fileId, ws, `${c1}9:${c2}10`),
+    detectarLayoutVentas(fileId, ws),
+  ]);
   const mv = mostrador.values || [['', ''], ['', '']];
   const out = {
     manana: { mostradorEf: mv[0][0] || '', mostradorTj: mv[0][1] || '' },
@@ -479,12 +496,12 @@ async function leerVentaDia(fileId, semSheet, dateStr) {
     deliveries: [],
     clientes: [],
   };
-  if (day <= 4) {
+  if (day <= 4 && layout.hayDelivery) {
     const d = await excelReadRange(fileId, ws, `${c1}15:${c2}19`);
     out.deliveries = (d.values || []).map((row) => ({ ef: row[0] || '', tr: row[1] || '' }));
   }
   if (day <= 5) {
-    const cl = await excelReadRange(fileId, ws, `${c0}24:${c3}31`);
+    const cl = await excelReadRange(fileId, ws, `${c0}${layout.cliIni}:${c3}${layout.cliFin}`);
     out.clientes = (cl.values || []).map((row) => { const m = marcaCobro(row[3]); return { nombre: row[0] || '', ef: row[1] || '', tr: row[2] || '', cobrado: estaCobrado(m), lemon: m === 'LEMON' }; });
   }
   return out;
@@ -516,11 +533,13 @@ async function excelSyncVentaDia(fileId, semSheet, dateStr, turno, turnoForm, de
   // escrituras donde un corte de conexión podía guardar, por ejemplo, el mostrador y el delivery
   // pero no los clientes especiales, sin ningún aviso claro de cuál quedó a medio camino.
   const rangoMostrador = `${c1}${fila}:${c2}${fila}`;
+  const layout = await detectarLayoutVentas(fileId, ws);
   const rangoDelivery = `${c1}15:${c2}19`;
-  const rangoClientes = `${c0}24:${c3}31`;
+  const rangoClientes = `${c0}${layout.cliIni}:${c3}${layout.cliFin}`;
   const [actualMostrador, actualDelivery, actualClientes] = await Promise.all([
     excelReadRange(fileId, ws, rangoMostrador),
-    deliveriesDirty && day <= 4 ? excelReadRange(fileId, ws, rangoDelivery) : Promise.resolve(null),
+    // Delivery solo existe en la plantilla vieja; en la v5 esas filas son de Clientes y nunca se tocan.
+    deliveriesDirty && layout.hayDelivery && day <= 4 ? excelReadRange(fileId, ws, rangoDelivery) : Promise.resolve(null),
     clientesDirty && day <= 5 ? excelReadRange(fileId, ws, rangoClientes) : Promise.resolve(null),
   ]);
 
